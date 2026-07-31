@@ -196,6 +196,194 @@ fn get_language_name(code: &str) -> &str {
     }
 }
 
+fn is_prompt_enhancement_requested(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    let lower = trimmed.to_lowercase();
+
+    let prefixes = [
+        "this is prompt:",
+        "this is a prompt:",
+        "this is prompt",
+        "this is a prompt",
+        "enhance prompt:",
+        "enhance prompt",
+        "prompt:",
+        "यह प्रॉम्प्ट है:",
+        "यह प्रॉम्प्ट है",
+        "प्रॉम्प्ट:",
+    ];
+
+    for prefix in prefixes {
+        if lower.starts_with(prefix) {
+            let len = prefix.len();
+            let remaining = trimmed[len..].trim();
+            // Clean up leading colons, commas, dashes, whitespace
+            let clean = remaining
+                .trim_start_matches(|c: char| c.is_whitespace() || c == ':' || c == ',' || c == '-' || c == '.')
+                .trim();
+            if !clean.is_empty() {
+                return Some(clean.to_string());
+            }
+        }
+    }
+    None
+}
+
+async fn enhance_prompt_via_llm(
+    settings: &AppSettings,
+    transcription: &str,
+    custom_system_prompt: Option<String>,
+) -> Option<String> {
+    if is_blank_transcription(transcription) {
+        debug!("Prompt enhancement skipped because the transcription is empty");
+        return None;
+    }
+
+    let provider = match settings.active_post_process_provider().cloned() {
+        Some(provider) => provider,
+        None => {
+            debug!("Prompt enhancement enabled but no post-processing provider is selected");
+            return None;
+        }
+    };
+
+    let model = settings
+        .post_process_models
+        .get(&provider.id)
+        .cloned()
+        .unwrap_or_default();
+
+    if model.trim().is_empty() {
+        debug!(
+            "Prompt enhancement skipped because provider '{}' has no model configured",
+            provider.id
+        );
+        return None;
+    }
+
+    let api_key = settings
+        .post_process_api_keys
+        .get(&provider.id)
+        .cloned()
+        .unwrap_or_default();
+
+    let default_system_prompt = "You are an expert prompt engineer. Your task is to take a draft, spoken prompt idea and rewrite it into a highly detailed, professional, structured prompt (using clear headers, context, instructions, output formatting constraints, etc.) that is ready to copy-paste. If the input draft is not in English, translate and enhance it to English. Respond ONLY with the final enhanced prompt. Do not include any explanations, introduction, or markdown code blocks (unless the code blocks are part of the prompt itself).";
+    let system_prompt = custom_system_prompt.unwrap_or_else(|| default_system_prompt.to_string());
+    let user_content = transcription.to_string();
+
+    let (reasoning_effort, reasoning) = match provider.id.as_str() {
+        "custom" => (Some("none".to_string()), None),
+        "openrouter" => (
+            None,
+            Some(crate::llm_client::ReasoningConfig {
+                effort: Some("none".to_string()),
+                exclude: Some(true),
+            }),
+        ),
+        _ => (None, None),
+    };
+
+    debug!(
+        "Starting LLM prompt enhancement with provider '{}' (model: {})",
+        provider.id, model
+    );
+
+    // Handle Apple Intelligence separately since it uses native Swift APIs
+    if provider.id == APPLE_INTELLIGENCE_PROVIDER_ID {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            if !apple_intelligence::check_apple_intelligence_availability() {
+                debug!("Apple Intelligence selected but not currently available on this device");
+                return None;
+            }
+
+            let token_limit = model.trim().parse::<i32>().unwrap_or(0);
+            return match apple_intelligence::process_text_with_system_prompt(
+                &system_prompt,
+                &user_content,
+                token_limit,
+            ) {
+                Ok(result) => {
+                    if result.trim().is_empty() {
+                        None
+                    } else {
+                        Some(strip_invisible_chars(&result))
+                    }
+                }
+                Err(err) => {
+                    error!("Apple Intelligence prompt enhancement failed: {}", err);
+                    None
+                }
+            };
+        }
+
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            debug!("Apple Intelligence provider selected on unsupported platform");
+            return None;
+        }
+    }
+
+    if provider.supports_structured_output {
+        let json_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                (TRANSCRIPTION_FIELD): {
+                    "type": "string",
+                    "description": "The detailed and enhanced version of the prompt"
+                }
+            },
+            "required": [TRANSCRIPTION_FIELD],
+            "additionalProperties": false
+        });
+
+        match crate::llm_client::send_chat_completion_with_schema(
+            &provider,
+            api_key.clone(),
+            &model,
+            user_content.clone(),
+            Some(system_prompt.to_string()),
+            Some(json_schema),
+            reasoning_effort.clone(),
+            reasoning.clone(),
+        )
+        .await
+        {
+            Ok(Some(content)) => {
+                match serde_json::from_str::<serde_json::Value>(&content) {
+                    Ok(json) => {
+                        if let Some(val) = json.get(TRANSCRIPTION_FIELD).and_then(|t| t.as_str()) {
+                            return Some(strip_invisible_chars(val));
+                        } else {
+                            return Some(strip_invisible_chars(&content));
+                        }
+                    }
+                    Err(_) => return Some(strip_invisible_chars(&content)),
+                }
+            }
+            Ok(None) => return None,
+            Err(e) => {
+                warn!("Structured output prompt enhancement failed: {}. Falling back to legacy.", e);
+            }
+        }
+    }
+
+    let full_prompt = format!("{}\n\nText:\n{}", system_prompt, user_content);
+    match crate::llm_client::send_chat_completion(
+        &provider,
+        api_key,
+        &model,
+        full_prompt,
+        reasoning_effort,
+        reasoning,
+    )
+    .await
+    {
+        Ok(Some(content)) => Some(strip_invisible_chars(&content)),
+        _ => None,
+    }
+}
+
 async fn translate_text_via_llm(
     settings: &AppSettings,
     transcription: &str,
@@ -674,6 +862,29 @@ pub(crate) async fn process_transcription_output(
     let mut final_text = transcription.to_string();
     let mut post_processed_text: Option<String> = None;
     let mut post_process_prompt: Option<String> = None;
+
+    if let Some(draft_prompt) = is_prompt_enhancement_requested(transcription) {
+        let mut custom_system_prompt = None;
+        if let Ok(dir) = crate::portable::app_data_dir(app) {
+            let rules_path = dir.join("prompt_enhancer_rules.txt");
+            if rules_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(rules_path) {
+                    let trimmed = content.trim();
+                    if !trimmed.is_empty() {
+                        custom_system_prompt = Some(trimmed.to_string());
+                    }
+                }
+            }
+        }
+
+        if let Some(enhanced) = enhance_prompt_via_llm(&settings, &draft_prompt, custom_system_prompt).await {
+            return ProcessedTranscription {
+                final_text: enhanced.clone(),
+                post_processed_text: Some(enhanced),
+                post_process_prompt: Some("Prompt Enhancement".to_string()),
+            };
+        }
+    }
 
     // Resolve the language the transcription actually ran in (the persisted
     // intent coerced against the loaded model's capabilities) so OpenCC keys off
