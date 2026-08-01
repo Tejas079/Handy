@@ -384,6 +384,129 @@ async fn enhance_prompt_via_llm(
     }
 }
 
+async fn enhance_selected_text_via_llm(
+    app: &AppHandle,
+    selected_text: &str,
+) -> Option<String> {
+    if selected_text.trim().is_empty() {
+        return None;
+    }
+
+    let settings = get_settings(app);
+
+    let provider = match settings.active_post_process_provider().cloned() {
+        Some(provider) => provider,
+        None => {
+            debug!("Enhance selected text: no post-processing provider is selected");
+            return None;
+        }
+    };
+
+    let model = settings
+        .post_process_models
+        .get(&provider.id)
+        .cloned()
+        .unwrap_or_default();
+
+    if model.trim().is_empty() {
+        debug!(
+            "Enhance selected text skipped because provider '{}' has no model configured",
+            provider.id
+        );
+        return None;
+    }
+
+    let api_key = settings
+        .post_process_api_keys
+        .get(&provider.id)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut system_prompt = "You are an expert editor. Correct any grammar, spelling, and punctuation errors in the user's text to make it natural and perfect English. Respond ONLY with the corrected text, maintaining the original meaning and formatting. Do not include any explanations, introductions, or markdown code blocks.".to_string();
+
+    if let Ok(dir) = crate::portable::app_data_dir(app) {
+        let rules_path = dir.join("enhance_selected_text_rules.txt");
+        if rules_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(rules_path) {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    system_prompt = trimmed.to_string();
+                }
+            }
+        }
+    }
+
+    let user_content = selected_text.to_string();
+
+    let (reasoning_effort, reasoning) = match provider.id.as_str() {
+        "custom" => (Some("none".to_string()), None),
+        "openrouter" => (
+            None,
+            Some(crate::llm_client::ReasoningConfig {
+                effort: Some("none".to_string()),
+                exclude: Some(true),
+            }),
+        ),
+        _ => (None, None),
+    };
+
+    debug!(
+        "Starting LLM text enhancement with provider '{}' (model: {})",
+        provider.id, model
+    );
+
+    // Handle Apple Intelligence separately since it uses native Swift APIs
+    if provider.id == APPLE_INTELLIGENCE_PROVIDER_ID {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            if !apple_intelligence::check_apple_intelligence_availability() {
+                debug!("Apple Intelligence selected but not currently available on this device");
+                return None;
+            }
+
+            let token_limit = model.trim().parse::<i32>().unwrap_or(0);
+            return match apple_intelligence::process_text_with_system_prompt(
+                &system_prompt,
+                &user_content,
+                token_limit,
+            ) {
+                Ok(result) => {
+                    if result.trim().is_empty() {
+                        None
+                    } else {
+                        Some(strip_invisible_chars(&result))
+                    }
+                }
+                Err(err) => {
+                    error!("Apple Intelligence text enhancement failed: {}", err);
+                    None
+                }
+            };
+        }
+
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            debug!("Apple Intelligence provider selected on unsupported platform");
+            return None;
+        }
+    }
+
+    let full_prompt = format!("{}\n\nText:\n{}", system_prompt, user_content);
+    match crate::llm_client::send_chat_completion(
+        &provider,
+        api_key,
+        &model,
+        full_prompt,
+        reasoning_effort,
+        reasoning,
+    )
+    .await
+    {
+        Ok(Some(content)) => Some(strip_invisible_chars(&content)),
+        _ => None,
+    }
+}
+
 async fn translate_text_via_llm(
     settings: &AppSettings,
     transcription: &str,
@@ -1386,6 +1509,121 @@ impl ShortcutAction for TestAction {
     }
 }
 
+// Enhance Selected Text Action
+struct EnhanceSelectedTextAction;
+
+impl ShortcutAction for EnhanceSelectedTextAction {
+    fn start(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
+        debug!("EnhanceSelectedTextAction::start called for binding: {}", binding_id);
+
+        let ah = app.clone();
+        tauri::async_runtime::spawn(async move {
+            use tauri_plugin_clipboard_manager::ClipboardExt;
+            use crate::input::EnigoState;
+
+            // Show processing overlay
+            show_processing_overlay(&ah);
+            
+            // Wait a tiny moment to let user release keys if they were held down
+            tokio::time::sleep(Duration::from_millis(150)).await;
+
+            // Read current clipboard to save it
+            let clipboard = ah.clipboard();
+            let saved_text = clipboard.read_text().ok().filter(|t| !t.is_empty());
+            let saved_image = if saved_text.is_none() {
+                clipboard.read_image().ok().map(|image| image.to_owned())
+            } else {
+                None
+            };
+
+            // Clear clipboard to detect if copying succeeds
+            let _ = clipboard.clear();
+
+            // Lock enigo and simulate copy keys inside a nested scope to drop MutexGuard before await
+            let copy_success = {
+                if let Some(enigo_state) = ah.try_state::<EnigoState>() {
+                    if let Ok(mut enigo) = enigo_state.0.lock() {
+                        crate::input::send_copy_ctrl_c(&mut enigo).is_ok()
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+
+            if !copy_success {
+                error!("Failed to simulate copy keys");
+                // Restore clipboard
+                if let Some(txt) = saved_text {
+                    let _ = clipboard.write_text(txt);
+                } else if let Some(img) = saved_image {
+                    let _ = clipboard.write_image(&img);
+                }
+                utils::hide_recording_overlay(&ah);
+                return;
+            }
+
+            // Wait a moment for OS clipboard to update
+            tokio::time::sleep(Duration::from_millis(150)).await;
+
+            // Get selected text
+            let selected_text = match clipboard.read_text() {
+                Ok(text) => text,
+                Err(_) => String::new(),
+            };
+
+            if selected_text.trim().is_empty() {
+                debug!("No text was selected, skipping enhancement");
+                // Restore clipboard
+                if let Some(txt) = saved_text {
+                    let _ = clipboard.write_text(txt);
+                } else if let Some(img) = saved_image {
+                    let _ = clipboard.write_image(&img);
+                }
+                utils::hide_recording_overlay(&ah);
+                return;
+            }
+
+            // Call LLM to enhance text
+            if let Some(enhanced_text) = enhance_selected_text_via_llm(&ah, &selected_text).await {
+                // Restore old clipboard first so paste replaces it but keeps it clean
+                if let Some(txt) = saved_text {
+                    let _ = clipboard.write_text(txt);
+                } else if let Some(img) = saved_image {
+                    let _ = clipboard.write_image(&img);
+                }
+                
+                // Perform paste on the main thread
+                let ah_clone = ah.clone();
+                let paste_res = ah.run_on_main_thread(move || {
+                    if let Err(e) = crate::clipboard::paste(enhanced_text, ah_clone) {
+                        error!("Failed to paste enhanced text: {}", e);
+                    }
+                });
+                if let Err(e) = paste_res {
+                    error!("Failed to run paste on main thread: {:?}", e);
+                }
+            } else {
+                debug!("Text enhancement failed or returned empty, restoring clipboard");
+                // Restore clipboard
+                if let Some(txt) = saved_text {
+                    let _ = clipboard.write_text(txt);
+                } else if let Some(img) = saved_image {
+                    let _ = clipboard.write_image(&img);
+                }
+            }
+
+            // Hide processing overlay
+            utils::hide_recording_overlay(&ah);
+        });
+    }
+
+    fn stop(&self, _app: &AppHandle, _binding_id: &str, _shortcut_str: &str) {
+        // No-op
+    }
+}
+
 // Static Action Map
 pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::new(|| {
     let mut map = HashMap::new();
@@ -1406,6 +1644,10 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
     map.insert(
         "test".to_string(),
         Arc::new(TestAction) as Arc<dyn ShortcutAction>,
+    );
+    map.insert(
+        "enhance_selected_text".to_string(),
+        Arc::new(EnhanceSelectedTextAction) as Arc<dyn ShortcutAction>,
     );
     map
 });

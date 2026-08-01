@@ -842,6 +842,26 @@ pub fn get_default_settings() -> AppSettings {
         },
     );
 
+    #[cfg(target_os = "macos")]
+    let default_enhance_shortcut = "option+command+g";
+    #[cfg(target_os = "windows")]
+    let default_enhance_shortcut = "ctrl+alt+g";
+    #[cfg(target_os = "linux")]
+    let default_enhance_shortcut = "ctrl+alt+g";
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    let default_enhance_shortcut = "ctrl+alt+g";
+
+    bindings.insert(
+        "enhance_selected_text".to_string(),
+        ShortcutBinding {
+            id: "enhance_selected_text".to_string(),
+            name: "Enhance Selected Text".to_string(),
+            description: "Corrects grammar and refines the selected text to perfect English.".to_string(),
+            default_binding: default_enhance_shortcut.to_string(),
+            current_binding: default_enhance_shortcut.to_string(),
+        },
+    );
+
     AppSettings {
         settings_schema_version: default_settings_schema_version(),
         bindings,
